@@ -70,6 +70,8 @@ static void sd_setup()
         .host = SDSPI_HOST_DEFAULT(),
     };
     sd_card_init(&sdcfg);
+
+    sd_card_mount();
 }
 
 static void sd_test()
@@ -194,16 +196,21 @@ static void gps_decode(char *gps_token)
     ESP_LOGI(TAG, "Course over ground: %.5f", gps_data.course_over_ground);
     ESP_LOGI(TAG, "UTC Date: %s", gps_data.utc_date);
     printf("\n");
+
+    char *sd_gps_data = calloc(200, sizeof(char));
+    sprintf(sd_gps_data, "%s,%s,%.5f,%.5f,%s,%.5f,%.5f",
+            gps_data.utc_date, gps_data.utc_time, gps_data.latitude, gps_data.longitude,
+            gps_data.e_w, gps_data.speed_over_ground, gps_data.course_over_ground);
+
+    sd_card_write("gps_data.csv", sd_gps_data);
+    free(sd_gps_data);
 }
 // $GNRMC,082943.00,A,3328.56838,N,12632.88343,E,0.050,,280423,,,A,V*10
 static void gps_task()
 {
     // Configure a temporary buffer for the incoming data
     uint8_t *buffer = (uint8_t *)malloc(BUF_SIZE_4096);
-    uint8_t *temp = (uint8_t *)malloc(BUF_SIZE_4096);
-    // int temp_len = 0;
 
-    int line_cnt = 0;
     while (1)
     {
         // Read data from the UART
@@ -226,7 +233,7 @@ static void gps_task()
         }
     }
     free(buffer);
-    free(temp);
+    vTaskDelay(NULL);
 }
 
 static void check_processing()
@@ -249,13 +256,9 @@ static void check_processing()
 
 static void timer_setup()
 {
-    // gptimer_d9_init(D9_GPTIMER_0, true);
-    // gptimer_d9_set_callback_function(D9_GPTIMER_0, gps_processing);
-    // gptimer_d9_start(D9_GPTIMER_0, true, sensing_interval, "gps_processing", 8192, 4, APP_CPU_NUM);
-
-    gptimer_d9_init(D9_GPTIMER_1, true);
-    gptimer_d9_set_callback_function(D9_GPTIMER_1, check_processing);
-    gptimer_d9_start(D9_GPTIMER_1, true, 5000, "check_processing", 2048, 1, PRO_CPU_NUM);
+    gptimer_d9_init(D9_GPTIMER_0, true);
+    gptimer_d9_set_callback_function(D9_GPTIMER_0, check_processing);
+    gptimer_d9_start(D9_GPTIMER_0, true, 5000, "check_processing", 2048, 1, PRO_CPU_NUM);
 }
 
 void app_main(void)
