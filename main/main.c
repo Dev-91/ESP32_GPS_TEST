@@ -12,13 +12,6 @@
 // utility_d9_lib
 #include <utility_d9.h>
 
-/* ESP32 SD Setting */
-// #define USER_SPI_MOSI_GPIO 26
-// #define USER_SPI_MISO_GPIO 25
-// #define USER_SPI_SCLK_GPIO 27
-
-// #define USER_SD_SPI_CS_GPIO 33
-
 typedef struct
 {
     char *utc_time;           // UTC time
@@ -47,6 +40,8 @@ gps_t gps_data;
 #define USER_BAUD_RATE 38400
 #define UART_PORT_NUM 1
 #define READ_TIME_OUT 3
+
+#define USER_LED_GPIO 42
 
 static const char *TAG = "GPS_TEST";
 
@@ -188,6 +183,10 @@ static void gps_decode(char *gps_token)
         token = strsep(&gps_token, ",");
         token_cnt++;
     }
+
+    if (gps_data.latitude != 0 && gps_data.longitude != 0)
+        blink(USER_LED_GPIO, 100, 1);
+
     ESP_LOGI(TAG, "UTC TIME: %s", gps_data.utc_time);
     ESP_LOGI(TAG, "Latitude: %.5f", gps_data.latitude);
     ESP_LOGI(TAG, "Longitude: %.5f", gps_data.longitude);
@@ -263,6 +262,9 @@ static void timer_setup()
 
 void app_main(void)
 {
+    blink_gpio_init(USER_LED_GPIO);
+    blink(USER_LED_GPIO, 200, 5);
+
     spi_bus_init();
     sd_setup();
 
