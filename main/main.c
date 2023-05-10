@@ -12,6 +12,8 @@
 // utility_d9_lib
 #include <utility_d9.h>
 
+#include "led_strip.h"
+
 typedef struct
 {
     char *utc_time;           // UTC time
@@ -43,7 +45,53 @@ gps_t gps_data;
 
 #define USER_LED_GPIO 42
 
+#define USER_LED_RMT_GPIO 48
+
+static led_strip_handle_t led_strip;
+
 static const char *TAG = "GPS_TEST";
+
+static void blink_led_rmt(uint8_t s_led_state)
+{
+    if (s_led_state)
+    {
+        /* Set the LED pixel using RGB from 0 (0%) to 255 (100%) for each color */
+        led_strip_set_pixel(led_strip, 0, 16, 16, 16);
+        /* Refresh the strip to send data */
+        led_strip_refresh(led_strip);
+    }
+    else
+    {
+        /* Set all LED off to clear all pixels */
+        led_strip_clear(led_strip);
+    }
+}
+
+static void blink_led_rmt_interval(int interval, int cnt)
+{
+    for (int i = 0; i < cnt; i++)
+    {
+        blink_led_rmt(true);
+        vTaskDelay(interval / portTICK_PERIOD_MS);
+        blink_led_rmt(false);
+        vTaskDelay(interval / portTICK_PERIOD_MS);
+    }
+}
+
+static void configure_led_rmt(int blink_gpio)
+{
+    /* LED strip initialization with the GPIO and pixels number*/
+    led_strip_config_t strip_config = {
+        .strip_gpio_num = blink_gpio,
+        .max_leds = 1, // at least one LED on board
+    };
+    led_strip_rmt_config_t rmt_config = {
+        .resolution_hz = 10 * 1000 * 1000, // 10MHz
+    };
+    ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_config, &rmt_config, &led_strip));
+    /* Set all LED off to clear all pixels */
+    led_strip_clear(led_strip);
+}
 
 static void spi_bus_init()
 {
@@ -138,6 +186,23 @@ static void uart_setup()
     uart_init(UART_PORT_NUM, &uart_gpio_cfg, &uart_cfg, BUF_SIZE_4096, READ_TIME_OUT);
 }
 
+static void get_rtk_value()
+{
+    char *get_rtk_cmd = "UBX-CFG-VALGET";
+    size_t cmd_len = strlen(get_rtk_cmd);
+    uart_write_bytes(UART_PORT_NUM, (const char *)get_rtk_cmd, cmd_len);
+
+    // Configure a temporary buffer for the incoming data
+    uint8_t *buffer = (uint8_t *)malloc(BUF_SIZE_1024);
+
+    int len = uart_read_bytes(UART_PORT_NUM, buffer, (BUF_SIZE_4096 - 1), 1000 / portTICK_PERIOD_MS);
+    if (len)
+    {
+        buffer[len] = '\0';
+        ESP_LOGI(TAG, "UBX-CFG-VALGET : %s", (char *)buffer);
+    }
+}
+
 static float parse_lat_long(float ll)
 {
     int deg = ((int)ll) / 100;
@@ -185,24 +250,27 @@ static void gps_decode(char *gps_token)
     }
 
     if (gps_data.latitude != 0 && gps_data.longitude != 0)
-        blink(USER_LED_GPIO, 100, 1);
+    {
+        // blink(USER_LED_GPIO, 100, 1);
+        blink_led_rmt_interval(100, 1);
 
-    ESP_LOGI(TAG, "UTC TIME: %s", gps_data.utc_time);
-    ESP_LOGI(TAG, "Latitude: %.5f", gps_data.latitude);
-    ESP_LOGI(TAG, "Longitude: %.5f", gps_data.longitude);
-    ESP_LOGI(TAG, "E/W: %s", gps_data.e_w);
-    ESP_LOGI(TAG, "Speed over ground: %.5f", gps_data.speed_over_ground);
-    ESP_LOGI(TAG, "Course over ground: %.5f", gps_data.course_over_ground);
-    ESP_LOGI(TAG, "UTC Date: %s", gps_data.utc_date);
-    printf("\n");
+        ESP_LOGI(TAG, "UTC TIME: %s", gps_data.utc_time);
+        ESP_LOGI(TAG, "Latitude: %.5f", gps_data.latitude);
+        ESP_LOGI(TAG, "Longitude: %.5f", gps_data.longitude);
+        ESP_LOGI(TAG, "E/W: %s", gps_data.e_w);
+        ESP_LOGI(TAG, "Speed over ground: %.5f", gps_data.speed_over_ground);
+        ESP_LOGI(TAG, "Course over ground: %.5f", gps_data.course_over_ground);
+        ESP_LOGI(TAG, "UTC Date: %s", gps_data.utc_date);
+        printf("\n");
 
-    char *sd_gps_data = calloc(200, sizeof(char));
-    sprintf(sd_gps_data, "%s,%s,%.5f,%.5f,%s,%.5f,%.5f",
-            gps_data.utc_date, gps_data.utc_time, gps_data.latitude, gps_data.longitude,
-            gps_data.e_w, gps_data.speed_over_ground, gps_data.course_over_ground);
+        char *sd_gps_data = calloc(200, sizeof(char));
+        sprintf(sd_gps_data, "%s,%s,%.5f,%.5f,%s,%.5f,%.5f",
+                gps_data.utc_date, gps_data.utc_time, gps_data.latitude, gps_data.longitude,
+                gps_data.e_w, gps_data.speed_over_ground, gps_data.course_over_ground);
 
-    sd_card_write("gps_data.csv", sd_gps_data);
-    free(sd_gps_data);
+        sd_card_write("gps_data.csv", sd_gps_data);
+        free(sd_gps_data);
+    }
 }
 // $GNRMC,082943.00,A,3328.56838,N,12632.88343,E,0.050,,280423,,,A,V*10
 static void gps_task()
@@ -232,7 +300,7 @@ static void gps_task()
         }
     }
     free(buffer);
-    vTaskDelay(NULL);
+    vTaskDelete(NULL);
 }
 
 static void check_processing()
@@ -262,15 +330,19 @@ static void timer_setup()
 
 void app_main(void)
 {
-    blink_gpio_init(USER_LED_GPIO);
-    blink(USER_LED_GPIO, 200, 5);
+    // blink_gpio_init(USER_LED_GPIO);
+    // blink(USER_LED_GPIO, 200, 5);
+    configure_led_rmt(USER_LED_RMT_GPIO);
+    blink_led_rmt_interval(200, 5);
 
     spi_bus_init();
     sd_setup();
 
     uart_setup();
 
-    timer_setup();
+    // get_rtk_value();
+
+    // timer_setup();
 
     xTaskCreate(gps_task, "gps_task", 8192, NULL, 10, NULL);
 }
