@@ -1,6 +1,7 @@
 #include <stdio.h>
 
 // file_sys_d9_lib
+#include <spiffs_d9.h>
 #include <sd_d9.h>
 
 // serial_d9_lib
@@ -12,30 +13,72 @@
 // utility_d9_lib
 #include <utility_d9.h>
 
-#include "led_strip.h"
+// network_d9_lib
+#include <network_d9.h>
+#include <ethernet_d9.h>
+#include <wifi_d9.h>
+#include <wifi_ap_d9.h>
+
+// packet_d9_lib
+#include <packet_d9.h>
+
+/* Log Tag */
+static const char *TAG = "MAIN";
+static const char *TAG_ETH = "ETHERNET";
+static const char *TAG_WIFI = "WIFI";
+static const char *TAG_SD = "SD_CARD";
+static const char *TAG_SPIFFS = "SPIFFS";
+static const char *TAG_HTTP = "HTTP_CLIENT";
+static const char *TAG_TIME = "TIME";
+static const char *TAG_MEMORY = "MEMORY";
+static const char *TAG_PACKET = "PACKET";
 
 typedef struct
 {
-    char *utc_time;           // UTC time
-    float latitude;           // 위도
-    float longitude;          // 경도
-    char *e_w;                // E/W
+    char utc_time[7]; // UTC time
+    char utc_date[7]; // UTC date
+    float latitude;   // 위도'
+    char n_s[2];
+    float longitude; // 경도
+    char e_w[2];     // E/W
+
+    int position_fix;    // Position Fix
+    int satellites_used; // Satellites used 현재 수신되는 위성 개수
+
+    float hdop;     // Horizontal Dilution of Precision
+    float altitude; // WGS-84 타원체에서 평균 해수면(MSL)을 기준으로한 고도
+    char altitude_unit[2];
+    float geoid_seperation; // MSL과 Geoid의 고도차. 마이너스 값이 나올 수 있음
+    char seperation_unit[2];
+
     float speed_over_ground;  // km/h = knots * 1.852
     float course_over_ground; // degrees. 진행방향 진북을 중심으로 시계방향
-    char *utc_date;           // UTC date
 } gps_t;
 
 gps_t gps_data;
 
-/* ESP32-S3 SD Setting */
-#define USER_SPI_MOSI_GPIO 11
-#define USER_SPI_MISO_GPIO 13
-#define USER_SPI_SCLK_GPIO 12
+typedef struct
+{
+    int gps_interval;
+} set_config_t;
 
-#define USER_SD_SPI_CS_GPIO 10
+static set_config_t set_cfg;
+
+/* ESP32-S3 SD Setting */
+#define USER_SPI_MOSI_GPIO 26
+#define USER_SPI_MISO_GPIO 25
+#define USER_SPI_SCLK_GPIO 27
+
+#define USER_SD_SPI_CS_GPIO 32
+#define USER_SD_CD_GPIO 35
+
+#define USER_ETH_SPI_CS_GPIO 33
+#define USER_ETH_SPI_INT_GPIO 4
+#define USER_ETH_SPI_PHY_RST_GPIO -1
+#define USER_ETH_SPI_PHY_ADDR_GPIO 1
 
 /* UART Setting */
-#define USER_RX_GPIO 18
+#define USER_RX_GPIO 16
 #define USER_TX_GPIO 17
 #define USER_RTS -1
 #define USER_CTS -1
@@ -43,124 +86,150 @@ gps_t gps_data;
 #define UART_PORT_NUM 1
 #define READ_TIME_OUT 3
 
-#define USER_LED_GPIO 42
+#define USER_BLINK_GPIO 5
 
-#define USER_LED_RMT_GPIO 48
+#define DEVICE_NUM "0"
 
-static led_strip_handle_t led_strip;
+static bool gps_receive_flag = false;
+int network_ret = -1;
 
-static const char *TAG = "GPS_TEST";
-
-static void blink_led_rmt(uint8_t s_led_state)
+static void config_init()
 {
-    if (s_led_state)
+    memset(&set_cfg, 0, sizeof(set_config_t));
+}
+
+static void default_config_read()
+{
+    set_cfg.gps_interval = CONFIG_DEFAULT_GPS_INTERVAL;
+}
+
+static void spiffs_setup()
+{
+    esp_vfs_spiffs_conf_t conf = {
+        .base_path = "/spiffs",
+        .partition_label = NULL,
+        .max_files = 5,
+        .format_if_mount_failed = true};
+
+    spiffs_init(&conf);
+}
+
+static void spiffs_set_cfg_read()
+{
+    int read_buf_size = 100;
+    char *read_buf = calloc(read_buf_size, sizeof(char));
+    int ret = spiffs_file_read("/spiffs/set_cfg.csv", read_buf, read_buf_size);
+    // esp_vfs_spiffs_unregister(conf.partition_label);
+    if (ret == 0)
     {
-        /* Set the LED pixel using RGB from 0 (0%) to 255 (100%) for each color */
-        led_strip_set_pixel(led_strip, 0, 16, 16, 16);
-        /* Refresh the strip to send data */
-        led_strip_refresh(led_strip);
+        char split_buf[50][5] = {0};
+        for (int i = 0;; i++)
+        {
+            int rc = split_data(read_buf, strlen(read_buf), ",", split_buf[i], i);
+            if (rc == -1)
+                break;
+        }
+
+        set_config_t set_cfg_buf;
+
+        memset(&set_cfg_buf, 0, sizeof(set_config_t));
+
+        set_cfg.gps_interval = atoi(split_buf[0]);
+        // set_cfg.gps_interval = atoi(split_buf[0]);
+
+        ESP_LOGI(TAG, "SPIFFS GPS Interval : %d", set_cfg.gps_interval);
+
+        ESP_LOGI(TAG, "Use the spiffs set config");
     }
     else
     {
-        /* Set all LED off to clear all pixels */
-        led_strip_clear(led_strip);
-    }
-}
+        char *write_data = calloc(100, sizeof(char));
+        sprintf(write_data, "%d\n", CONFIG_DEFAULT_GPS_INTERVAL);
 
-static void blink_led_rmt_interval(int interval, int cnt)
-{
-    for (int i = 0; i < cnt; i++)
-    {
-        blink_led_rmt(true);
-        vTaskDelay(interval / portTICK_PERIOD_MS);
-        blink_led_rmt(false);
-        vTaskDelay(interval / portTICK_PERIOD_MS);
+        spiffs_file_write("/spiffs/set_cfg.csv", "w", write_data);
+        free(write_data);
     }
-}
-
-static void configure_led_rmt(int blink_gpio)
-{
-    /* LED strip initialization with the GPIO and pixels number*/
-    led_strip_config_t strip_config = {
-        .strip_gpio_num = blink_gpio,
-        .max_leds = 1, // at least one LED on board
-    };
-    led_strip_rmt_config_t rmt_config = {
-        .resolution_hz = 10 * 1000 * 1000, // 10MHz
-    };
-    ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_config, &rmt_config, &led_strip));
-    /* Set all LED off to clear all pixels */
-    led_strip_clear(led_strip);
+    free(read_buf);
 }
 
 static void spi_bus_init()
 {
+    spi_device_handle_t spi;
+
     spi_bus_config_t buscfg = {
         .miso_io_num = USER_SPI_MISO_GPIO,
         .mosi_io_num = USER_SPI_MOSI_GPIO,
         .sclk_io_num = USER_SPI_SCLK_GPIO,
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
-        .max_transfer_sz = 4000,
     };
-    spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO);
+    spi_bus_initialize(HSPI_HOST, &buscfg, SPI_DMA_CH_AUTO); // S3: SPI2_HOST
+
+    // SPI Bus Add device
+    spi_device_interface_config_t sd_devcfg = {
+        .clock_speed_hz = 2000000,
+        .mode = 0,
+        .spics_io_num = USER_SD_SPI_CS_GPIO,
+        .queue_size = 1,
+    };
+    spi_bus_add_device(HSPI_HOST, &sd_devcfg, &spi);
+
+    spi_device_interface_config_t eth_devcfg = {
+        .clock_speed_hz = ETH_SPI_CLOCK_MHZ * 1000 * 1000,
+        .mode = 0,
+        .spics_io_num = USER_ETH_SPI_CS_GPIO,
+        .queue_size = 20,
+    };
+    spi_bus_add_device(HSPI_HOST, &eth_devcfg, &spi);
+}
+
+static int network_setup()
+{
+    // euthernet & wifi common init
+    net_init();
+
+#if CONFIG_USER_ETH_W5500_ENABLE == 0
+    // ethernet init &connection
+    ESP_LOGI(TAG, "CONFIG_USER_ETH_W5500_ENABLE: %d", CONFIG_USER_ETH_W5500_ENABLE);
+    spi_eth_module_config_t ethcfg = {
+        .spi_cs_gpio = USER_ETH_SPI_CS_GPIO,
+        .int_gpio = USER_ETH_SPI_INT_GPIO,
+        .phy_reset_gpio = USER_ETH_SPI_PHY_RST_GPIO,
+        .phy_addr = USER_ETH_SPI_PHY_ADDR_GPIO,
+    };
+
+    ethernet_init(&ethcfg);
+    network_ret = ethernet_connection_check();
+
+    if (network_ret == 0)
+        blink(USER_BLINK_GPIO, 100, 10);
+    else
+        blink(USER_BLINK_GPIO, 1000, 2);
+
+#endif
+
+    return -1;
 }
 
 static void sd_setup()
 {
     spi_sd_module_config_t sdcfg = {
         .spi_cs_gpio = USER_SD_SPI_CS_GPIO,
+        .sd_cd_gpio = USER_SD_CD_GPIO,
         .host = SDSPI_HOST_DEFAULT(),
     };
     sd_card_init(&sdcfg);
 
-    sd_card_mount();
-}
-
-static void sd_test()
-{
-    if (sd_card_mount() == 0)
+    if (sd_card_detect() != 0)
     {
-        if (file_exists("Hello.txt") == 0)
-        {
-            sd_card_delete("Hello.txt");
-        }
-        if (file_exists("Hello.txt") == -1)
-        {
-            sd_card_write("Hello.txt", "Hello SD :D\n");
-        }
-        vTaskDelay(1000 / portTICK_PERIOD_MS);
+        ESP_LOGW(TAG, "No SD card detected.");
+        return;
+    }
 
-        size_t read_buf_size = 100 * sizeof(char);
-        char *read_buf = (char *)calloc(read_buf_size, sizeof(char));
-        ESP_LOGI(TAG, "sizeof(read_buf) : %d\n", read_buf_size);
-
-        ESP_LOGI(TAG, "sd_mount_check : %d\n", sd_mount_check());
-
-        sd_card_read("Hello.txt", read_buf, read_buf_size);
-
-        ESP_LOGI(TAG, "%s", read_buf);
-        free(read_buf);
-        vTaskDelay(1000 / portTICK_PERIOD_MS);
-        sd_card_unmount();
-        ESP_LOGI(TAG, "sd_mount_check : %d\n", sd_mount_check());
-
-        char *read_buf2 = (char *)calloc(read_buf_size, sizeof(char));
-        vTaskDelay(1000 / portTICK_PERIOD_MS);
-        sd_card_read("Hello.txt", read_buf2, read_buf_size);
-
-        ESP_LOGI(TAG, "%s", read_buf2);
-
-        if (sd_card_mount() == 0)
-        {
-            vTaskDelay(1000 / portTICK_PERIOD_MS);
-            sd_card_read("Hello.txt", read_buf2, read_buf_size);
-
-            ESP_LOGI(TAG, "sd_mount_check : %d\n", sd_mount_check());
-
-            ESP_LOGI(TAG, "%s", read_buf2);
-            free(read_buf2);
-        }
+    if (sd_card_mount() != 0)
+    {
+        ESP_LOGW(TAG, "Failed to mount SD card.");
+        return;
     }
 }
 
@@ -186,24 +255,7 @@ static void uart_setup()
     uart_init(UART_PORT_NUM, &uart_gpio_cfg, &uart_cfg, BUF_SIZE_4096, READ_TIME_OUT);
 }
 
-static void get_rtk_value()
-{
-    char *get_rtk_cmd = "UBX-CFG-VALGET";
-    size_t cmd_len = strlen(get_rtk_cmd);
-    uart_write_bytes(UART_PORT_NUM, (const char *)get_rtk_cmd, cmd_len);
-
-    // Configure a temporary buffer for the incoming data
-    uint8_t *buffer = (uint8_t *)malloc(BUF_SIZE_1024);
-
-    int len = uart_read_bytes(UART_PORT_NUM, buffer, (BUF_SIZE_4096 - 1), 1000 / portTICK_PERIOD_MS);
-    if (len)
-    {
-        buffer[len] = '\0';
-        ESP_LOGI(TAG, "UBX-CFG-VALGET : %s", (char *)buffer);
-    }
-}
-
-static float parse_lat_long(float ll)
+static float parse_lati_longi(float ll)
 {
     int deg = ((int)ll) / 100;
     float min = ll - (deg * 100);
@@ -211,11 +263,41 @@ static float parse_lat_long(float ll)
     return ll;
 }
 
-static void gps_decode(char *gps_token)
+static int gps_chksum_check(const char *data)
+{
+    char *ori_chksum_str = strchr(data, '*') + 1;
+    int ori_chksum = strtol(ori_chksum_str, NULL, 16);
+
+    char *cal_data = strchr(data, '$') + 1;
+
+    int n = 0;
+    char cal_chksum = NULL;
+
+    while (1)
+    {
+        if (cal_data[n] == '*')
+            break;
+
+        cal_chksum ^= (char)cal_data[n];
+        n++;
+    }
+
+    if (cal_chksum == ori_chksum)
+        return 0;
+
+    return -1;
+}
+
+static void gps_rmc_decode(char *gps_token)
 {
     memset(&gps_data, 0, sizeof(gps_t));
 
     int token_cnt = 0;
+
+    int ret = gps_chksum_check(gps_token);
+
+    if (ret != 0)
+        return;
 
     char *token = strsep(&gps_token, ",");
     while (token != NULL)
@@ -224,16 +306,19 @@ static void gps_decode(char *gps_token)
         switch (token_cnt)
         {
         case 1:
-            gps_data.utc_time = token;
+            strncpy(gps_data.utc_time, token, 6);
             break;
         case 3:
-            gps_data.latitude = parse_lat_long(atof(token));
+            gps_data.latitude = parse_lati_longi(atof(token));
+            break;
+        case 4:
+            strncpy(gps_data.n_s, token, 1);
             break;
         case 5:
-            gps_data.longitude = parse_lat_long(atof(token));
+            gps_data.longitude = parse_lati_longi(atof(token));
             break;
         case 6:
-            gps_data.e_w = token;
+            strncpy(gps_data.e_w, token, 1);
             break;
         case 7:
             gps_data.speed_over_ground = atof(token);
@@ -242,41 +327,88 @@ static void gps_decode(char *gps_token)
             gps_data.course_over_ground = atof(token);
             break;
         case 9:
-            gps_data.utc_date = token;
+            strncpy(gps_data.utc_date, token, 6);
+            break;
+        }
+        token = strsep(&gps_token, ",");
+        token_cnt++;
+    }
+}
+
+static void gps_gga_decode(char *gps_token)
+{
+    int token_cnt = 0;
+
+    int ret = gps_chksum_check(gps_token);
+
+    if (ret != 0)
+        return;
+
+    char *token = strsep(&gps_token, ",");
+    while (token != NULL)
+    {
+        // printf("token %d: %s\n", token_cnt, token);
+        switch (token_cnt)
+        {
+        case 6:
+            gps_data.position_fix = atoi(token);
+            break;
+        case 7:
+            gps_data.satellites_used = atof(token);
+            break;
+        case 8:
+            gps_data.hdop = atof(token);
+            break;
+        case 9:
+            gps_data.altitude = atof(token);
+            break;
+        case 10:
+            strncpy(gps_data.altitude_unit, token, 1);
+            break;
+        case 11:
+            gps_data.geoid_seperation = atof(token);
+            break;
+        case 12:
+            strncpy(gps_data.seperation_unit, token, 1);
             break;
         }
         token = strsep(&gps_token, ",");
         token_cnt++;
     }
 
-    if (gps_data.latitude != 0 && gps_data.longitude != 0)
+    if (gps_data.position_fix != 0)
     {
-        // blink(USER_LED_GPIO, 100, 1);
-        blink_led_rmt_interval(100, 1);
-
-        ESP_LOGI(TAG, "UTC TIME: %s", gps_data.utc_time);
-        ESP_LOGI(TAG, "Latitude: %.5f", gps_data.latitude);
-        ESP_LOGI(TAG, "Longitude: %.5f", gps_data.longitude);
-        ESP_LOGI(TAG, "E/W: %s", gps_data.e_w);
-        ESP_LOGI(TAG, "Speed over ground: %.5f", gps_data.speed_over_ground);
-        ESP_LOGI(TAG, "Course over ground: %.5f", gps_data.course_over_ground);
-        ESP_LOGI(TAG, "UTC Date: %s", gps_data.utc_date);
-        printf("\n");
-
-        char *sd_gps_data = calloc(200, sizeof(char));
-        sprintf(sd_gps_data, "%s,%s,%.5f,%.5f,%s,%.5f,%.5f",
-                gps_data.utc_date, gps_data.utc_time, gps_data.latitude, gps_data.longitude,
-                gps_data.e_w, gps_data.speed_over_ground, gps_data.course_over_ground);
-
-        sd_card_write("gps_data.csv", sd_gps_data);
-        free(sd_gps_data);
+        blink(USER_BLINK_GPIO, 100, 1);
+        gps_receive_flag = true;
+    }
+    else
+    {
+        gps_receive_flag = false;
     }
 }
-// $GNRMC,082943.00,A,3328.56838,N,12632.88343,E,0.050,,280423,,,A,V*10
+
+static void gps_data_sd_save()
+{
+    char *file_name = calloc(20, sizeof(char));
+    char *sd_gps_data = calloc(200, sizeof(char));
+    // SD Card Data Save
+    sprintf(sd_gps_data, "%s,%s,%.5f,%.5f,%s,%.5f,%.5f",
+            gps_data.utc_date, gps_data.utc_time, gps_data.latitude, gps_data.longitude,
+            gps_data.e_w, gps_data.speed_over_ground, gps_data.course_over_ground);
+
+    sprintf(file_name, "GPS_%s.csv", gps_data.utc_date);
+
+    sd_card_write(file_name, sd_gps_data);
+    free(file_name);
+    free(sd_gps_data);
+}
+
 static void gps_task()
 {
     // Configure a temporary buffer for the incoming data
     uint8_t *buffer = (uint8_t *)malloc(BUF_SIZE_4096);
+
+    int gps_cnt = 0;
 
     while (1)
     {
@@ -284,20 +416,49 @@ static void gps_task()
         int len = uart_read_bytes(UART_PORT_NUM, buffer, (BUF_SIZE_4096 - 1), 200 / portTICK_PERIOD_MS);
         buffer[len] = '\0';
         // ESP_LOGI(TAG, "Received Data : \n%s", buffer);
+        bool rmc_flag = false;
+        bool gga_flag = false;
+
+        char *rmc_token = calloc(120, sizeof(char));
+        char *gga_token = calloc(120, sizeof(char));
 
         char *token = strtok((const char *)buffer, "\n");
+
         while (token != NULL)
         {
+            // printf("token: %s\n", token);
             if (strstr(token, "RMC") != NULL)
             {
-                gps_decode(token);
-                token = strtok(NULL, "\n");
-                break;
-                // continue;
+                strcpy(rmc_token, token);
+                ESP_LOGI(TAG, "%s", rmc_token);
+                rmc_flag = true;
             }
-            // printf("%s\n", token);
+            else if (strstr(token, "GGA") != NULL)
+            {
+                strcpy(gga_token, token);
+                ESP_LOGI(TAG, "%s", gga_token);
+                gga_flag = true;
+            }
+
             token = strtok(NULL, "\n");
         }
+
+        if (rmc_flag && gga_flag)
+        {
+            gps_cnt++;
+            if (gps_cnt >= set_cfg.gps_interval)
+            {
+                // $GNRMC,070000.00,A,3333.27906,N,12644.81225,E,0.049,,050623,,,A,V*1F
+                gps_rmc_decode(rmc_token);
+                // $GNGGA,070000.00,3333.27906,N,12644.81225,E,1,12,0.73,5.9,M,20.4,M,,*4B
+                gps_gga_decode(gga_token);
+                delay_ms(100);
+                gps_data_sd_save();
+                gps_cnt = 0;
+            }
+        }
+        free(rmc_token);
+        free(gga_token);
     }
     free(buffer);
     vTaskDelete(NULL);
@@ -314,9 +475,9 @@ static void check_processing()
         sprintf(save_buf, "memory leak rebooting heap memory size : %d", heap_size);
         ESP_LOGE(TAG, "%s\n", save_buf);
 
-        vTaskDelay(10 / portTICK_PERIOD_MS);
+        delay_ms(10);
         sd_card_write("err_log.txt", save_buf);
-        vTaskDelay(1000 / portTICK_PERIOD_MS);
+        delay_ms(1000);
         esp_restart(); // memory가 10000이하로 내려가면 디바이스 리셋
     }
 }
@@ -328,21 +489,39 @@ static void timer_setup()
     gptimer_d9_start(D9_GPTIMER_0, true, 5000, "check_processing", 2048, 1, PRO_CPU_NUM);
 }
 
+static void gpio_setup()
+{
+    blink_gpio_init(USER_BLINK_GPIO);
+
+    gpio_reset_pin(USER_SD_CD_GPIO);
+    gpio_set_direction(USER_SD_CD_GPIO, GPIO_MODE_INPUT);
+}
+
 void app_main(void)
 {
-    // blink_gpio_init(USER_LED_GPIO);
-    // blink(USER_LED_GPIO, 200, 5);
-    configure_led_rmt(USER_LED_RMT_GPIO);
-    blink_led_rmt_interval(200, 5);
+    ESP_LOGI(TAG, "app_main function start");
+    delay_ms(get_random_int(1000, 2000));
+
+    gpio_setup();
+    blink(USER_BLINK_GPIO, 200, 5);
+
+    config_init();
+    default_config_read();
+
+    spiffs_setup();
+    spiffs_set_cfg_read();
 
     spi_bus_init();
+
     sd_setup();
+
+    network_setup();
 
     uart_setup();
 
-    // get_rtk_value();
+    timer_setup();
 
-    // timer_setup();
+    delay_ms(2000);
 
-    xTaskCreate(gps_task, "gps_task", 8192, NULL, 10, NULL);
+    xTaskCreate(gps_task, "gps_task", 8192, NULL, 5, NULL);
 }
