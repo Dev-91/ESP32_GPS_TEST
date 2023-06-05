@@ -25,5 +25,4 @@ Debuger : ESP-Prog
 
 ## Image
 
-![IMG_7992](https://github.com/Dev-91/ESP32_ETH_SD/assets/38420069/f20b48b8-1e74-4d81-9084-f8131ce547e0)
-
+![ESP32_GPS_TEST](https://github.com/Dev-91/ESP32_GPS_TEST/assets/38420069/0a4b2af0-8bab-4ac1-a4e3-6b8d97fe36a9)
